@@ -20,7 +20,7 @@ from typing import Any, NamedTuple, TypeVar
 
 # We need to import _compat itself in addition to the _compat members to avoid
 # having the thread-local in the globals here.
-from . import _compat, _config, setters
+from . import _compat, _config, _policy, setters
 from ._compat import (
     PY_3_10_PLUS,
     PY_3_11_PLUS,
@@ -57,6 +57,11 @@ _EMPTY_METADATA_SINGLETON = types.MappingProxyType({})
 _SENTINEL = object()
 
 _DEFAULT_ON_SETATTR = setters.pipe(setters.convert, setters.validate)
+
+# Names of the local variables the generated __init__ uses to cache the
+# per-instance policy view once per construction.
+_POLICY_CONVERT_VAR = "__attrs_policy_convert__"
+_POLICY_VALIDATE_VAR = "__attrs_policy_validate__"
 
 
 class _Nothing(enum.Enum):
@@ -639,7 +644,14 @@ def evolve(*args, **changes):
         if init_name not in changes:
             changes[init_name] = getattr(inst, attr_name)
 
-    return cls(**changes)
+    # Let the new instance's construction observe the source instance's
+    # pushed convert/validate frames for the duration of the call.
+    propagated = _policy.begin_construction(inst)
+    try:
+        return cls(**changes)
+    finally:
+        if propagated:
+            _policy.end_construction(inst)
 
 
 class _ClassBuilder:
@@ -2071,13 +2083,21 @@ def _setattr(attr_name: str, value_var: str, has_on_setattr: bool) -> str:
 
 
 def _setattr_with_converter(
-    attr_name: str, value_var: str, has_on_setattr: bool, converter: Converter
+    attr_name: str,
+    value_var: str,
+    has_on_setattr: bool,
+    converter: Converter,
+    gate_var: str,
 ) -> str:
     """
     Use the cached object.setattr to set *attr_name* to *value_var*, but run
-    its converter first.
+    its converter first (unless *gate_var* says the frame skips converters
+    during construction).
     """
-    return f"_setattr('{attr_name}', {converter._fmt_converter_call(attr_name, value_var)})"
+    return (
+        f"_setattr('{attr_name}', "
+        f"{_fmt_converted_value(converter, attr_name, value_var, gate_var)})"
+    )
 
 
 def _assign(attr_name: str, value: str, has_on_setattr: bool) -> str:
@@ -2092,16 +2112,38 @@ def _assign(attr_name: str, value: str, has_on_setattr: bool) -> str:
 
 
 def _assign_with_converter(
-    attr_name: str, value_var: str, has_on_setattr: bool, converter: Converter
+    attr_name: str,
+    value_var: str,
+    has_on_setattr: bool,
+    converter: Converter,
+    gate_var: str,
 ) -> str:
     """
     Unless *attr_name* has an on_setattr hook, use normal assignment after
     conversion. Otherwise relegate to _setattr_with_converter.
     """
     if has_on_setattr:
-        return _setattr_with_converter(attr_name, value_var, True, converter)
+        return _setattr_with_converter(
+            attr_name, value_var, True, converter, gate_var
+        )
 
-    return f"self.{attr_name} = {converter._fmt_converter_call(attr_name, value_var)}"
+    return (
+        f"self.{attr_name} = "
+        f"{_fmt_converted_value(converter, attr_name, value_var, gate_var)}"
+    )
+
+
+def _fmt_converted_value(
+    converter: Converter, attr_name: str, value_var: str, gate_var: str
+) -> str:
+    """
+    Return an expression that converts *value_var* for *attr_name* only when
+    the construction convert gate allows it, and otherwise yields the raw
+    value.
+    """
+    converted = converter._fmt_converter_call(attr_name, value_var)
+
+    return f"({converted} if {gate_var} else {value_var})"
 
 
 def _determine_setters(
@@ -2133,13 +2175,17 @@ def _determine_setters(
             value_var: str,
             has_on_setattr: bool,
             converter: Converter,
+            gate_var: str,
         ) -> str:
             if has_on_setattr or _is_slot_attr(attr_name, base_attr_map):
                 return _setattr_with_converter(
-                    attr_name, value_var, has_on_setattr, converter
+                    attr_name, value_var, has_on_setattr, converter, gate_var
                 )
 
-            return f"_inst_dict['{attr_name}'] = {converter._fmt_converter_call(attr_name, value_var)}"
+            return (
+                f"_inst_dict['{attr_name}'] = "
+                f"{_fmt_converted_value(converter, attr_name, value_var, gate_var)}"
+            )
 
         return (
             ("_inst_dict = self.__dict__",),
@@ -2196,6 +2242,20 @@ def _attrs_to_init_script(
     names_for_globals = {}
     annotations = {"return": None}
 
+    # Cache the merged per-instance policy view once, before any converter
+    # call and before the validation block. With an empty stack the readers
+    # return the pinned defaults, so generated code behaves exactly as before.
+    if any(a.converter is not None for a in attrs):
+        lines.append(
+            f"{_POLICY_CONVERT_VAR} = _policy_init_converts(self)"
+        )
+        names_for_globals["_policy_init_converts"] = _policy.init_converts
+    if any(a.validator for a in attrs):
+        lines.append(
+            f"{_POLICY_VALIDATE_VAR} = _policy_init_validates(self)"
+        )
+        names_for_globals["_policy_init_validates"] = _policy.init_validates
+
     for a in attrs:
         if a.validator:
             attrs_to_validate.append(a)
@@ -2226,6 +2286,7 @@ def _attrs_to_init_script(
                             init_factory_name + f"({maybe_self})",
                             has_on_setattr,
                             converter,
+                            _POLICY_CONVERT_VAR,
                         )
                     )
                     names_for_globals[converter._get_global_name(a.name)] = (
@@ -2247,6 +2308,7 @@ def _attrs_to_init_script(
                         f"attr_dict['{attr_name}'].default",
                         has_on_setattr,
                         converter,
+                        _POLICY_CONVERT_VAR,
                     )
                 )
                 names_for_globals[converter._get_global_name(a.name)] = (
@@ -2271,7 +2333,11 @@ def _attrs_to_init_script(
             if converter is not None:
                 lines.append(
                     fmt_setter_with_converter(
-                        attr_name, arg_name, has_on_setattr, converter
+                        attr_name,
+                        arg_name,
+                        has_on_setattr,
+                        converter,
+                        _POLICY_CONVERT_VAR,
                     )
                 )
                 names_for_globals[converter._get_global_name(a.name)] = (
@@ -2294,7 +2360,11 @@ def _attrs_to_init_script(
                 lines.append(
                     "    "
                     + fmt_setter_with_converter(
-                        attr_name, arg_name, has_on_setattr, converter
+                        attr_name,
+                        arg_name,
+                        has_on_setattr,
+                        converter,
+                        _POLICY_CONVERT_VAR,
                     )
                 )
                 lines.append("else:")
@@ -2305,6 +2375,7 @@ def _attrs_to_init_script(
                         init_factory_name + "(" + maybe_self + ")",
                         has_on_setattr,
                         converter,
+                        _POLICY_CONVERT_VAR,
                     )
                 )
                 names_for_globals[converter._get_global_name(a.name)] = (
@@ -2334,7 +2405,11 @@ def _attrs_to_init_script(
             if converter is not None:
                 lines.append(
                     fmt_setter_with_converter(
-                        attr_name, arg_name, has_on_setattr, converter
+                        attr_name,
+                        arg_name,
+                        has_on_setattr,
+                        converter,
+                        _POLICY_CONVERT_VAR,
                     )
                 )
                 names_for_globals[converter._get_global_name(a.name)] = (
@@ -2351,8 +2426,7 @@ def _attrs_to_init_script(
                 annotations[arg_name] = converter._first_param_type
 
     if attrs_to_validate:  # we can skip this if there are no validators.
-        names_for_globals["_config"] = _config
-        lines.append("if _config._run_validators is True:")
+        lines.append(f"if {_POLICY_VALIDATE_VAR}:")
         for a in attrs_to_validate:
             val_name = "__attr_validator_" + a.name
             attr_name = "__attr_" + a.name

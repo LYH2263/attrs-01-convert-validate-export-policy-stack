@@ -5,6 +5,7 @@ import copy
 
 from ._compat import get_generic_base
 from ._make import _OBJ_SETATTR, NOTHING, fields
+from . import _policy
 from .exceptions import AttrsAttributeNotFoundError
 
 
@@ -32,6 +33,10 @@ def asdict(
     dict_factory=dict,
     retain_collection_types=False,
     value_serializer=None,
+    *,
+    _policy_level=0,
+    _policy_public_only=False,
+    _policy_shallow=False,
 ):
     """
     Return the *attrs* attribute values of *inst* as a dict.
@@ -77,9 +82,19 @@ def asdict(
     ..  versionadded:: 21.3.0
         If a dict has a collection for a key, it is serialized as a tuple.
     """
+    # Only the outermost call resolves the instance's export profile; the
+    # view is then carried through the internal recursion.
+    if _policy_level == 0:
+        export = _policy.asdict_export(inst)
+        _policy_public_only = export.public_only
+        _policy_shallow = export.shallow
+
     attrs = fields(inst.__class__)
     rv = dict_factory()
     for a in attrs:
+        if _policy_public_only and a.name.startswith("_"):
+            continue
+
         v = getattr(inst, a.name)
         if filter is not None and not filter(a, v):
             continue
@@ -92,14 +107,20 @@ def asdict(
             if value_type in _ATOMIC_TYPES:
                 rv[a.name] = v
             elif has(value_type):
-                rv[a.name] = asdict(
-                    v,
-                    recurse=True,
-                    filter=filter,
-                    dict_factory=dict_factory,
-                    retain_collection_types=retain_collection_types,
-                    value_serializer=value_serializer,
-                )
+                if _policy_shallow:
+                    rv[a.name] = v
+                else:
+                    rv[a.name] = asdict(
+                        v,
+                        recurse=True,
+                        filter=filter,
+                        dict_factory=dict_factory,
+                        retain_collection_types=retain_collection_types,
+                        value_serializer=value_serializer,
+                        _policy_level=_policy_level + 1,
+                        _policy_public_only=_policy_public_only,
+                        _policy_shallow=_policy_shallow,
+                    )
             elif issubclass(value_type, (tuple, list, set, frozenset)):
                 cf = value_type if retain_collection_types is True else list
                 items = [
@@ -110,6 +131,9 @@ def asdict(
                         dict_factory=dict_factory,
                         retain_collection_types=retain_collection_types,
                         value_serializer=value_serializer,
+                        _policy_level=_policy_level + 1,
+                        _policy_public_only=_policy_public_only,
+                        _policy_shallow=_policy_shallow,
                     )
                     for i in v
                 ]
@@ -132,6 +156,9 @@ def asdict(
                             dict_factory=df,
                             retain_collection_types=retain_collection_types,
                             value_serializer=value_serializer,
+                            _policy_level=_policy_level + 1,
+                            _policy_public_only=_policy_public_only,
+                            _policy_shallow=_policy_shallow,
                         ),
                         _asdict_anything(
                             vv,
@@ -140,6 +167,9 @@ def asdict(
                             dict_factory=df,
                             retain_collection_types=retain_collection_types,
                             value_serializer=value_serializer,
+                            _policy_level=_policy_level + 1,
+                            _policy_public_only=_policy_public_only,
+                            _policy_shallow=_policy_shallow,
                         ),
                     )
                     for kk, vv in v.items()
@@ -158,6 +188,10 @@ def _asdict_anything(
     dict_factory,
     retain_collection_types,
     value_serializer,
+    *,
+    _policy_level=1,
+    _policy_public_only=False,
+    _policy_shallow=False,
 ):
     """
     ``asdict`` only works on attrs instances, this works on anything.
@@ -168,15 +202,24 @@ def _asdict_anything(
         if value_serializer is not None:
             rv = value_serializer(None, None, rv)
     elif getattr(val_type, "__attrs_attrs__", None) is not None:
-        # Attrs class.
-        rv = asdict(
-            val,
-            recurse=True,
-            filter=filter,
-            dict_factory=dict_factory,
-            retain_collection_types=retain_collection_types,
-            value_serializer=value_serializer,
-        )
+        # Attrs class. A shallow export leaves nested attrs instances as-is
+        # and treats them like opaque values.
+        if _policy_shallow:
+            rv = val
+            if value_serializer is not None:
+                rv = value_serializer(None, None, rv)
+        else:
+            rv = asdict(
+                val,
+                recurse=True,
+                filter=filter,
+                dict_factory=dict_factory,
+                retain_collection_types=retain_collection_types,
+                value_serializer=value_serializer,
+                _policy_level=_policy_level + 1,
+                _policy_public_only=_policy_public_only,
+                _policy_shallow=_policy_shallow,
+            )
     elif issubclass(val_type, (tuple, list, set, frozenset)):
         if retain_collection_types is True:
             cf = val.__class__
@@ -194,6 +237,9 @@ def _asdict_anything(
                     dict_factory=dict_factory,
                     retain_collection_types=retain_collection_types,
                     value_serializer=value_serializer,
+                    _policy_level=_policy_level + 1,
+                    _policy_public_only=_policy_public_only,
+                    _policy_shallow=_policy_shallow,
                 )
                 for i in val
             ]
@@ -209,6 +255,9 @@ def _asdict_anything(
                     dict_factory=df,
                     retain_collection_types=retain_collection_types,
                     value_serializer=value_serializer,
+                    _policy_level=_policy_level + 1,
+                    _policy_public_only=_policy_public_only,
+                    _policy_shallow=_policy_shallow,
                 ),
                 _asdict_anything(
                     vv,
@@ -217,6 +266,9 @@ def _asdict_anything(
                     dict_factory=df,
                     retain_collection_types=retain_collection_types,
                     value_serializer=value_serializer,
+                    _policy_level=_policy_level + 1,
+                    _policy_public_only=_policy_public_only,
+                    _policy_shallow=_policy_shallow,
                 ),
             )
             for kk, vv in val.items()
@@ -235,6 +287,10 @@ def astuple(
     filter=None,
     tuple_factory=tuple,
     retain_collection_types=False,
+    *,
+    _policy_level=0,
+    _policy_public_only=False,
+    _policy_shallow=False,
 ):
     """
     Return the *attrs* attribute values of *inst* as a tuple.
@@ -271,10 +327,20 @@ def astuple(
 
     ..  versionadded:: 16.2.0
     """
+    # Only the outermost call resolves the instance's export profile; the
+    # view is then carried through the internal recursion.
+    if _policy_level == 0:
+        export = _policy.astuple_export(inst)
+        _policy_public_only = export.public_only
+        _policy_shallow = export.shallow
+
     attrs = fields(inst.__class__)
     rv = []
     retain = retain_collection_types  # Very long. :/
     for a in attrs:
+        if _policy_public_only and a.name.startswith("_"):
+            continue
+
         v = getattr(inst, a.name)
         if filter is not None and not filter(a, v):
             continue
@@ -283,15 +349,21 @@ def astuple(
             if value_type in _ATOMIC_TYPES:
                 rv.append(v)
             elif has(value_type):
-                rv.append(
-                    astuple(
-                        v,
-                        recurse=True,
-                        filter=filter,
-                        tuple_factory=tuple_factory,
-                        retain_collection_types=retain,
+                if _policy_shallow:
+                    rv.append(v)
+                else:
+                    rv.append(
+                        astuple(
+                            v,
+                            recurse=True,
+                            filter=filter,
+                            tuple_factory=tuple_factory,
+                            retain_collection_types=retain,
+                            _policy_level=_policy_level + 1,
+                            _policy_public_only=_policy_public_only,
+                            _policy_shallow=_policy_shallow,
+                        )
                     )
-                )
             elif issubclass(value_type, (tuple, list, set, frozenset)):
                 cf = v.__class__ if retain is True else list
                 items = [
@@ -302,8 +374,11 @@ def astuple(
                             filter=filter,
                             tuple_factory=tuple_factory,
                             retain_collection_types=retain,
+                            _policy_level=_policy_level + 1,
+                            _policy_public_only=_policy_public_only,
+                            _policy_shallow=_policy_shallow,
                         )
-                        if has(j.__class__)
+                        if has(j.__class__) and not _policy_shallow
                         else j
                     )
                     for j in v
@@ -326,8 +401,11 @@ def astuple(
                                     kk,
                                     tuple_factory=tuple_factory,
                                     retain_collection_types=retain,
+                                    _policy_level=_policy_level + 1,
+                                    _policy_public_only=_policy_public_only,
+                                    _policy_shallow=_policy_shallow,
                                 )
-                                if has(kk.__class__)
+                                if has(kk.__class__) and not _policy_shallow
                                 else kk
                             ),
                             (
@@ -335,8 +413,11 @@ def astuple(
                                     vv,
                                     tuple_factory=tuple_factory,
                                     retain_collection_types=retain,
+                                    _policy_level=_policy_level + 1,
+                                    _policy_public_only=_policy_public_only,
+                                    _policy_shallow=_policy_shallow,
                                 )
-                                if has(vv.__class__)
+                                if has(vv.__class__) and not _policy_shallow
                                 else vv
                             ),
                         )

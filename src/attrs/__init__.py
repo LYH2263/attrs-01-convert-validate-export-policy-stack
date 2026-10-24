@@ -25,7 +25,7 @@ from attr import (
 from attr._make import ClassProps
 from attr._next_gen import asdict, astuple, inspect
 
-from . import converters, exceptions, filters, setters, validators
+from . import converters, exceptions, filters, policies, setters, validators
 
 
 __all__ = [
@@ -63,6 +63,7 @@ __all__ = [
     "inspect",
     "make_class",
     "mutable",
+    "policies",
     "resolve_types",
     "setters",
     "validate",

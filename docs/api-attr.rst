@@ -209,6 +209,15 @@ All objects from `attrs.setters` are also available in ``attr.setters``.
 Please refer to the former for details.
 
 
+Policy Stacks
+-------------
+
+.. module:: attr.policies
+
+All objects from `attrs.policies` are also available in ``attr.policies``.
+Please refer to the former for details.
+
+
 Deprecated APIs
 ---------------
 

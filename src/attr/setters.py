@@ -4,7 +4,7 @@
 Commonly used hooks for on_setattr.
 """
 
-from . import _config
+from . import _policy
 from .exceptions import FrozenAttributeError
 
 
@@ -39,9 +39,14 @@ def validate(instance, attrib, new_value):
     """
     Run *attrib*'s validator on *new_value* if it has one.
 
+    Whether validation actually runs is determined by the ``on_setattr`` exit
+    of *instance*'s policy stack: ``force_on`` runs it even when the global
+    switch disables validators, ``force_off`` skips it without touching the
+    global switch, and with an empty stack the global switch is followed.
+
     .. versionadded:: 20.1.0
     """
-    if _config._run_validators is False:
+    if not _policy.setattr_validates(instance):
         return new_value
 
     v = attrib.validator
@@ -58,10 +63,15 @@ def convert(instance, attrib, new_value):
     Run *attrib*'s converter -- if it has one -- on *new_value* and return the
     result.
 
+    Whether the converter runs is determined by the ``on_setattr`` exit of
+    *instance*'s policy stack (``pin_always`` runs it; ``skip`` and
+    ``init_only`` skip it here; an empty stack always runs it). This never
+    changes whether validation runs.
+
     .. versionadded:: 20.1.0
     """
     c = attrib.converter
-    if c:
+    if c and _policy.setattr_converts(instance):
         # This can be removed once we drop 3.8 and use attrs.Converter instead.
         from ._make import Converter
 

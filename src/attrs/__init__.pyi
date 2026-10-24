@@ -35,6 +35,7 @@ from attr import filters as filters
 from attr import has as has
 from attr import make_class as make_class
 from attr import NOTHING as NOTHING
+from attr import policies as policies
 from attr import resolve_types as resolve_types
 from attr import setters as setters
 from attr import validate as validate

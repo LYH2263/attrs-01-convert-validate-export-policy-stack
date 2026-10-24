@@ -7,7 +7,7 @@ Classes Without Boilerplate
 from functools import partial
 from typing import Callable, Literal, Protocol
 
-from . import converters, exceptions, filters, setters, validators
+from . import converters, exceptions, filters, policies, setters, validators
 from ._cmp import cmp_using
 from ._config import get_run_validators, set_run_validators
 from ._funcs import asdict, assoc, astuple, has, resolve_types
@@ -69,6 +69,7 @@ __all__ = [
     "ib",
     "make_class",
     "mutable",
+    "policies",
     "resolve_types",
     "s",
     "set_run_validators",

@@ -781,3 +781,98 @@ All setters in ``attrs.setters`` are also available from ``attr.setters`` (it's 
 
    .. tip::
       Use `attrs.define`'s *frozen* argument (or `attrs.frozen`) to freeze whole classes; it is more efficient.
+
+
+.. _api_policies:
+
+Policy Stacks
+-------------
+
+.. module:: attrs.policies
+
+Sometimes you need to change how conversion, validation or exporting behaves for one instance and one block of code only -- without touching `attrs.validators.set_disabled`, class definitions or other threads.
+The policy stack is an instance-scoped, thread-local stack of frames that each carry three independent gates:
+
+- ``convert_gate``: `attrs.policies.ConvertGate` -- when converters run;
+- ``validate_gate``: `attrs.policies.ValidateGate` -- when validators run, independently of the global switch;
+- ``export_profile``: `attrs.policies.ExportProfile` -- how `attrs.asdict` and `attrs.astuple` export.
+
+Push a frame with `attrs.policies.pushed` (or `attrs.policies.push` / `attrs.policies.pop`).
+Frames stack: the innermost non-default channel wins, and popping a frame restores the outer one.
+With an empty stack, behavior is identical to the regular API.
+
+.. warning::
+
+   Frames are visible only to the thread that pushed them, even for the same instance.
+   This is stricter than the global `attrs.validators.set_disabled` switch, which is not thread-safe.
+
+For example, force validation to run even though it is globally disabled:
+
+.. doctest::
+
+   >>> from attrs import asdict, define, evolve, field, policies, validators
+   >>> @define
+   ... class C:
+   ...     x = field(validator=validators.instance_of(int))
+   >>> i = C(1)
+   >>> validators.set_disabled(True)
+   >>> i.x = "2"  # accepted: global validation is disabled
+   >>> with policies.pushed(i, validate_gate=policies.ValidateGate.force_on):
+   ...     i.x = "3"
+   Traceback (most recent call last):
+       ...
+   TypeError: ("'x' must be <class 'int'> (got '3' that is a <class 'str'>).", ...)
+
+Skipping converters never also disables validation, and frames popped during `attrs.evolve` propagate to the new instance's construction:
+
+.. doctest::
+
+   >>> validators.set_disabled(False)
+   >>> @define
+   ... class D:
+   ...     x = field(converter=int)
+   >>> j = D("1")
+   >>> j.x
+   1
+   >>> with policies.pushed(j, convert_gate=policies.ConvertGate.skip,
+   ...                      validate_gate=policies.ValidateGate.force_off):
+   ...     evolve(j, x="42").x
+   '42'
+
+Export profiles shape both exports while their *filter*, factories, *retain_collection_types* and *value_serializer* arguments keep their meaning:
+
+.. doctest::
+
+   >>> @define
+   ... class Inner:
+   ...     a: int
+   ...     _b: int
+   >>> @define
+   ... class Outer:
+   ...     name: str
+   ...     inner: Inner
+   >>> o = Outer("n", Inner(1, 2))
+   >>> with policies.pushed(o, export_profile=policies.ExportProfile.public_only):
+   ...     asdict(o)
+   {'name': 'n', 'inner': {'a': 1}}
+   >>> with policies.pushed(o, export_profile=policies.ExportProfile.shallow):
+   ...     asdict(o)
+   {'name': 'n', 'inner': Inner(a=1, _b=2)}
+
+.. autoclass:: ConvertGate
+   :members:
+   :undoc-members:
+
+.. autoclass:: ValidateGate
+   :members:
+   :undoc-members:
+
+.. autoclass:: ExportProfile
+   :members:
+   :undoc-members:
+
+.. autofunction:: push
+.. autofunction:: pop
+.. autofunction:: pushed
+.. autoclass:: Frame
+   :members:
